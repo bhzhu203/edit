@@ -4,6 +4,16 @@ A simple editor for simple needs.
 
 This editor pays homage to the classic [MS-DOS Editor](https://en.wikipedia.org/wiki/MS-DOS_Editor), but with a modern interface and input controls similar to VS Code. The goal is to provide an accessible editor that even users largely unfamiliar with terminals can easily use.
 
+## Features
+
+### Auto-Completion
+The editor includes intelligent auto-completion functionality:
+- **Context-aware suggestions**: Automatically suggests words based on content in the current buffer
+- **Keyboard navigation**: Use Up/Down arrow keys to navigate through suggestions when the popup is active
+- **Multiple acceptance methods**: Accept suggestions with Tab, Enter, or by clicking on the desired option
+- **Trigger manually**: Press Ctrl+Space to manually trigger auto-completion at any time
+- **Smart positioning**: The suggestion popup appears just below the cursor without blocking the current line
+
 ![Screenshot of Edit with the About dialog in the foreground](./assets/edit_hero_image.png)
 
 ## Installation
