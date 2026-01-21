@@ -23,6 +23,9 @@
 mod gap_buffer;
 mod navigation;
 
+/// Auto-completion functionality for the text editor
+pub mod autocomplete;
+
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::collections::LinkedList;
@@ -38,6 +41,7 @@ pub use gap_buffer::GapBuffer;
 use stdext::arena::{Arena, ArenaString, scratch_arena};
 
 use crate::cell::SemiRefCell;
+use crate::buffer::autocomplete::AutoCompleter;
 use crate::clipboard::Clipboard;
 use crate::document::{ReadableDocument, WriteableDocument};
 use crate::framebuffer::{Framebuffer, IndexedColor};
@@ -245,6 +249,9 @@ pub struct TextBuffer {
     overtype: bool,
 
     wants_cursor_visibility: bool,
+
+    // Auto-completion functionality
+    auto_completer: AutoCompleter,
 }
 
 impl TextBuffer {
@@ -293,6 +300,7 @@ impl TextBuffer {
             overtype: false,
 
             wants_cursor_visibility: false,
+            auto_completer: AutoCompleter::default(),
         })
     }
 
@@ -2843,6 +2851,121 @@ impl TextBuffer {
     /// For interfacing with ICU.
     pub fn read_forward(&self, off: usize) -> &[u8] {
         self.buffer.read_forward(off)
+    }
+
+    /// Trigger auto-completion at the current cursor position
+    pub fn trigger_auto_completion(&mut self) {
+        // We need to avoid the borrow checker issue by not passing self directly
+        // to the trigger_completion method. Instead, we'll extract the necessary
+        // information and pass it separately.
+        
+        // Get the current cursor position and offset
+        let current_pos = self.cursor_logical_pos();
+        let current_offset = self.cursor.offset;
+        
+        // Extract the prefix manually (similar to what trigger_completion does)
+        let prefix = self.extract_prefix_for_completion(current_offset);
+        
+        if prefix.len() >= 1 { // Changed from >= 2 to >= 1 for more responsive triggering
+            let completions = self.auto_completer.provider.get_completions(self, &prefix);
+            
+            if !completions.is_empty() {
+                self.auto_completer.state.prefix = prefix;
+                self.auto_completer.state.items = completions;
+                self.auto_completer.state.selected_index = 0;
+                self.auto_completer.state.is_active = true;
+                self.auto_completer.state.show_popup = true;
+                
+                // Calculate start position (position before the prefix)
+                let start_offset = current_offset - self.auto_completer.state.prefix.len();
+                self.auto_completer.state.start_pos = self.offset_to_point(start_offset);
+                self.auto_completer.state.end_pos = current_pos;
+            } else {
+                self.auto_completer.state.reset();
+            }
+        } else {
+            self.auto_completer.state.reset();
+        }
+    }
+    
+    // Helper method to extract prefix for completion
+    fn extract_prefix_for_completion(&self, current_offset: usize) -> String {
+        let mut prefix = String::new();
+        let mut offset = current_offset;
+        
+        // Move backwards to find the start of the word
+        while offset > 0 {
+            let chunk = self.read_backward(offset);
+            if chunk.is_empty() {
+                break;
+            }
+            
+            let chunk_start = offset - chunk.len();
+            let mut found_word_char = false;
+            
+            for &byte in chunk.iter().rev() {
+                let ch = byte as char;
+                if ch.is_alphanumeric() || ch == '_' {
+                    prefix.insert(0, ch);
+                    found_word_char = true;
+                } else {
+                    break;
+                }
+            }
+            
+            if !found_word_char {
+                break;
+            }
+            
+            offset = chunk_start;
+        }
+        
+        prefix
+    }
+    
+    // Helper method to convert offset to point
+    fn offset_to_point(&self, offset: usize) -> Point {
+        let cursor = self.cursor_move_to_offset_internal(Default::default(), offset);
+        cursor.logical_pos
+    }
+
+    /// Cancel the current auto-completion
+    pub fn cancel_auto_completion(&mut self) {
+        self.auto_completer.cancel_completion();
+    }
+
+    /// Accept the currently selected completion
+    pub fn accept_current_completion(&mut self) -> bool {
+        // Temporarily take ownership of the state to avoid borrow issues
+        let mut state = std::mem::take(&mut self.auto_completer.state);
+        let result = state.accept_current(self);
+        self.auto_completer.state = state;
+        result
+    }
+
+    /// Navigate to the next completion item
+    pub fn select_next_completion(&mut self) {
+        self.auto_completer.state.select_next();
+    }
+
+    /// Navigate to the previous completion item
+    pub fn select_prev_completion(&mut self) {
+        self.auto_completer.state.select_prev();
+    }
+
+    /// Check if auto-completion is currently active
+    pub fn is_completing(&self) -> bool {
+        self.auto_completer.is_completing()
+    }
+
+    /// Get the current auto-completion state
+    pub fn get_auto_completion_state(&self) -> &crate::buffer::autocomplete::AutoCompletionState {
+        &self.auto_completer.state
+    }
+
+    /// Get completion suggestions for a given prefix (for testing/debugging)
+    pub fn get_completions_for_prefix(&self, prefix: &str) -> Vec<crate::buffer::autocomplete::CompletionItem> {
+        self.auto_completer.provider.get_completions(self, prefix)
     }
 }
 

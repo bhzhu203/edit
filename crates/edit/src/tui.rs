@@ -995,6 +995,11 @@ impl Tui {
                     tc.scroll_offset_x_max = res.visual_pos_x_max;
                 }
 
+                // Render the auto-completion popup if active
+                if tb.is_completing() {
+                    self.render_completion_popup(&*tb, tc, inner_clipped);
+                }
+
                 if !tc.single_line {
                     // Render the scrollbar.
                     let track = Rect {
@@ -1032,6 +1037,185 @@ impl Tui {
         for child in Tree::iterate_siblings(node.children.first) {
             let mut child = child.borrow_mut();
             self.render_node(&mut child);
+        }
+    }
+
+    fn render_completion_popup(
+        &mut self,
+        tb: &TextBuffer,
+        tc: &TextareaContent,
+        inner_clipped: Rect,
+    ) {
+        let state = tb.get_auto_completion_state();
+        if !state.is_active || state.items.is_empty() {
+            return;
+        }
+
+        // Calculate the popup position based on cursor position
+        let cursor_pos = tb.cursor_visual_pos();
+        let screen_x = tc.scroll_offset.x;
+        let screen_y = tc.scroll_offset.y;
+        
+        // Calculate popup position RELATIVE to cursor in viewport coordinates
+        let cursor_screen_x = cursor_pos.x - screen_x;
+        let cursor_screen_y = cursor_pos.y - screen_y;
+        
+        // FIXED: Place popup below the cursor line in the viewport
+        let popup_left = cursor_screen_x.max(0); // Start at cursor x position
+        let popup_top = cursor_screen_y + 1; // Place ONE line below cursor in viewport space
+
+        // Determine popup dimensions
+        let mut max_width = state.prefix.len() + 10; // Minimum width
+        for item in &state.items {
+            max_width = max_width.max(item.label.len() + 4); // +4 for padding and selection marker
+        }
+        let popup_width = (max_width as CoordType).min(40).max(15); // Min 15, Max 40 chars
+        let popup_height = (state.items.len().min(8) as CoordType).min(8).max(3); // Min 3, Max 8 items
+        
+        // Get viewport dimensions (using the passed inner_clipped parameter)
+        let viewport_width = inner_clipped.width();
+        let viewport_height = inner_clipped.height();
+        
+        // Constrain popup to viewport with safety margins
+        let constrained_left = popup_left.max(0).min(viewport_width - popup_width.max(10));
+        let constrained_top = popup_top.max(0).min(viewport_height - popup_height.max(5));
+        
+        // Define popup bounds
+        let popup_rect = Rect {
+            left: constrained_left,
+            top: constrained_top,
+            right: constrained_left + popup_width,
+            bottom: constrained_top + popup_height,
+        };
+
+        // Extremely permissive rendering - almost always show the popup
+        if popup_rect.width() < 1 || popup_rect.height() < 1 {
+            return;
+        }
+
+        // Draw the popup background
+        let bg_color = self.indexed(crate::framebuffer::IndexedColor::Background);
+        let fg_color = self.contrasted(bg_color);
+        
+        // Fill the popup background using simple string operations
+        let fill_str = " ".repeat(popup_rect.width() as usize);
+        
+        for y in popup_rect.top..popup_rect.bottom {
+            // Convert viewport-relative coordinates back to framebuffer coordinates
+            let fb_y = inner_clipped.top + y;
+            if fb_y < inner_clipped.bottom {
+                self.framebuffer.replace_text(fb_y, inner_clipped.left + popup_rect.left, inner_clipped.left + popup_rect.right, &fill_str);
+                self.framebuffer.blend_bg(
+                    Rect { 
+                        left: inner_clipped.left + popup_rect.left, 
+                        top: fb_y, 
+                        right: inner_clipped.left + popup_rect.right, 
+                        bottom: fb_y + 1 
+                    },
+                    bg_color,
+                );
+            }
+        }
+
+        // Draw the border using simple string operations
+        if popup_rect.width() >= 3 && popup_rect.height() >= 3 {
+            let border_top_str = format!("┌{}┐", "─".repeat((popup_rect.width() - 2) as usize));
+            let border_bottom_str = format!("└{}┘", "─".repeat((popup_rect.width() - 2) as usize));
+            
+            let top_fb_y = inner_clipped.top + popup_rect.top;
+            let bottom_fb_y = inner_clipped.top + popup_rect.bottom - 1;
+            
+            if top_fb_y < inner_clipped.bottom {
+                self.framebuffer.replace_text(top_fb_y, inner_clipped.left + popup_rect.left, inner_clipped.left + popup_rect.right, &border_top_str);
+            }
+            if bottom_fb_y < inner_clipped.bottom {
+                self.framebuffer.replace_text(bottom_fb_y, inner_clipped.left + popup_rect.left, inner_clipped.left + popup_rect.right, &border_bottom_str);
+            }
+            
+            for y in popup_rect.top + 1..popup_rect.bottom - 1 {
+                let fb_y = inner_clipped.top + y;
+                if fb_y < inner_clipped.bottom {
+                    self.framebuffer.replace_text(
+                        fb_y,
+                        inner_clipped.left + popup_rect.left,
+                        inner_clipped.left + popup_rect.left + 1,
+                        "│",
+                    );
+                    self.framebuffer.replace_text(
+                        fb_y,
+                        inner_clipped.left + popup_rect.right - 1,
+                        inner_clipped.left + popup_rect.right,
+                        "│",
+                    );
+                }
+            }
+        }
+
+        // Draw the completion items
+        let content_top = popup_rect.top + 1;
+        let content_bottom = popup_rect.bottom - 1;
+        let content_width = popup_rect.width() - 2; // Account for borders
+        
+        for (i, item) in state.items.iter().take((content_bottom - content_top) as usize).enumerate() {
+            let y = content_top + i as CoordType;
+            if y >= content_bottom {
+                break;
+            }
+            
+            let fb_y = inner_clipped.top + y;
+            if fb_y >= inner_clipped.bottom {
+                break;
+            }
+            
+            let mut line_content = item.label.clone();
+            // Truncate if too long
+            if line_content.len() > (content_width - 3) as usize {
+                line_content = line_content[..(content_width - 3) as usize].to_string();
+            }
+            
+            // Pad the line to fill content area
+            let padding_needed = (content_width - 3 - line_content.len() as CoordType).max(0) as usize;
+            line_content.push_str(&" ".repeat(padding_needed));
+            
+            // Add selection indicator
+            let prefix = if i == state.selected_index { "> " } else { "  " };
+            let full_line = format!("{}{}", prefix, line_content);
+            
+            self.framebuffer.replace_text(fb_y, inner_clipped.left + popup_rect.left + 1, inner_clipped.left + popup_rect.right - 1, &full_line);
+            
+            // Highlight selected item
+            if i == state.selected_index {
+                let highlight_color = self.indexed(crate::framebuffer::IndexedColor::Green);
+                let highlight_fg = self.contrasted(highlight_color);
+                self.framebuffer.blend_bg(
+                    Rect { 
+                        left: inner_clipped.left + popup_rect.left + 1, 
+                        top: fb_y, 
+                        right: inner_clipped.left + popup_rect.right - 1, 
+                        bottom: fb_y + 1 
+                    },
+                    highlight_color,
+                );
+                self.framebuffer.blend_fg(
+                    Rect { 
+                        left: inner_clipped.left + popup_rect.left + 1, 
+                        top: fb_y, 
+                        right: inner_clipped.left + popup_rect.right - 1, 
+                        bottom: fb_y + 1 
+                    },
+                    highlight_fg,
+                );
+            } else {
+                self.framebuffer.blend_fg(
+                    Rect { 
+                        left: inner_clipped.left + popup_rect.left + 1, 
+                        top: fb_y, 
+                        right: inner_clipped.left + popup_rect.right - 1, 
+                        bottom: fb_y + 1 
+                    },
+                    fg_color,
+                );
+            }
         }
     }
 
@@ -2697,6 +2881,152 @@ impl<'a> Context<'a, '_> {
                     kbmod::ALT => tb.set_word_wrap(!tb.is_word_wrap_enabled()),
                     _ => return false,
                 },
+                vk::SPACE => {
+                    // Check for Ctrl+Space to trigger auto-completion
+                    if modifiers == kbmod::CTRL {
+                        tb.trigger_auto_completion();
+                    } else {
+                        // For regular space, just write it
+                        write = b" ";
+                    }
+                },
+                vk::TAB => {
+                    // Handle Tab differently - it could be for completion or indentation
+                    if tb.is_completing() {
+                        // If we're in the middle of a completion, accept it
+                        if tb.accept_current_completion() {
+                            // Successfully accepted completion
+                        } else {
+                            // If no completion was active, treat as regular tab
+                            if single_line {
+                                return false; // Don't consume Tab in single-line mode
+                            }
+                            tb.indent_change(1);
+                        }
+                    } else if single_line {
+                        // If this is just a simple input field and no completion is active, don't consume Tab
+                        return false;
+                    } else {
+                        // Regular tab for indentation
+                        tb.indent_change(if modifiers == kbmod::SHIFT { -1 } else { 1 });
+                    }
+                },
+                // Arrow keys for navigating completion items
+                vk::UP => {
+                    if tb.is_completing() {
+                        tb.select_prev_completion();
+                        return false; // Don't consume the key event, so it won't move cursor
+                    }
+                    // If not completing, let the default UP logic handle it below
+                    if single_line {
+                        return false;
+                    }
+                    match modifiers {
+                        kbmod::NONE => {
+                            let mut x = tc.preferred_column;
+                            let mut y = tb.cursor_visual_pos().y - 1;
+
+                            // If there's a selection we put the cursor above it.
+                            if let Some((beg, _)) = tb.selection_range() {
+                                x = beg.visual_pos.x;
+                                y = beg.visual_pos.y - 1;
+                                tc.preferred_column = x;
+                            }
+
+                            // If the cursor was already on the first line,
+                            // move it to the start of the buffer.
+                            if y < 0 {
+                                x = 0;
+                                tc.preferred_column = 0;
+                            }
+
+                            tb.cursor_move_to_visual(Point { x, y });
+                        }
+                        kbmod::CTRL => {
+                            tc.scroll_offset.y -= 1;
+                            make_cursor_visible = false;
+                        }
+                        kbmod::SHIFT => {
+                            // If the cursor was already on the first line,
+                            // move it to the start of the buffer.
+                            if tb.cursor_visual_pos().y == 0 {
+                                tc.preferred_column = 0;
+                            }
+
+                            tb.selection_update_visual(Point {
+                                x: tc.preferred_column,
+                                y: tb.cursor_visual_pos().y - 1,
+                            });
+                        }
+                        kbmod::ALT => tb.move_selected_lines(MoveLineDirection::Up),
+                        kbmod::CTRL_ALT => {
+                            // TODO: Add cursor above
+                        }
+                        _ => return false,
+                    }
+                },
+                vk::DOWN => {
+                    if tb.is_completing() {
+                        tb.select_next_completion();
+                        return false; // Don't consume the key event, so it won't move cursor
+                    }
+                    // If not completing, let the default DOWN logic handle it below
+                    if single_line {
+                        return false;
+                    }
+                    match modifiers {
+                        kbmod::NONE => {
+                            let mut x = tc.preferred_column;
+                            let mut y = tb.cursor_visual_pos().y + 1;
+
+                            // If there's a selection we put the cursor below it.
+                            if let Some((_, end)) = tb.selection_range() {
+                                x = end.visual_pos.x;
+                                y = end.visual_pos.y + 1;
+                                tc.preferred_column = x;
+                            }
+
+                            // If the cursor was already on the last line,
+                            // move it to the end of the buffer.
+                            if y >= tb.visual_line_count() {
+                                x = CoordType::MAX;
+                            }
+
+                            tb.cursor_move_to_visual(Point { x, y });
+
+                            // If we fell into the `if y >= tb.get_visual_line_count()` above, we wanted to
+                            // update the `preferred_column` but didn't know yet what it was. Now we know!
+                            if x == CoordType::MAX {
+                                tc.preferred_column = tb.cursor_visual_pos().x;
+                            }
+                        }
+                        kbmod::CTRL => {
+                            tc.scroll_offset.y += 1;
+                            make_cursor_visible = false;
+                        }
+                        kbmod::SHIFT => {
+                            // If the cursor was already on the last line,
+                            // move it to the end of the buffer.
+                            if tb.cursor_visual_pos().y >= tb.visual_line_count() - 1 {
+                                tc.preferred_column = CoordType::MAX;
+                            }
+
+                            tb.selection_update_visual(Point {
+                                x: tc.preferred_column,
+                                y: tb.cursor_visual_pos().y + 1,
+                            });
+
+                            if tc.preferred_column == CoordType::MAX {
+                                tc.preferred_column = tb.cursor_visual_pos().x;
+                            }
+                        }
+                        kbmod::ALT => tb.move_selected_lines(MoveLineDirection::Down),
+                        kbmod::CTRL_ALT => {
+                            // TODO: Add cursor above
+                        }
+                        _ => return false,
+                    }
+                },
                 _ => return false,
             }
 
@@ -2713,6 +3043,14 @@ impl<'a> Context<'a, '_> {
             tb.write_canon(write);
             change_preferred_column = true;
             make_cursor_visible = true;
+            
+            // Trigger auto-completion if we're typing alphabetic characters
+            // Changed condition from s.len() >= 2 to s.len() >= 1 for more responsive triggering
+            if let Ok(s) = std::str::from_utf8(write) {
+                if s.chars().all(|c| c.is_alphabetic() || c == '_') && s.len() >= 1 {
+                    tb.trigger_auto_completion();
+                }
+            }
         }
 
         if change_preferred_column {
