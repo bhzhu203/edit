@@ -2538,6 +2538,14 @@ impl<'a> Context<'a, '_> {
                         // If this is just a simple input field, don't consume Enter (= early return).
                         return false;
                     }
+                    // Check if we're in auto-completion mode
+                    if tb.is_completing() {
+                        // Accept the current completion with Enter
+                        if tb.accept_current_completion() {
+                            // Successfully accepted completion
+                            return true; // Consume the key event
+                        }
+                    }
                     write = b"\n";
                 }
                 vk::ESCAPE => {
