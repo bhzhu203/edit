@@ -2527,11 +2527,25 @@ impl<'a> Context<'a, '_> {
                     tb.delete(granularity, -1);
                 }
                 vk::TAB => {
-                    if single_line {
-                        // If this is just a simple input field, don't consume Tab (= early return).
+                    // Handle Tab differently - it could be for completion or indentation
+                    if tb.is_completing() {
+                        // If we're in the middle of a completion, accept it
+                        if tb.accept_current_completion() {
+                            // Successfully accepted completion
+                        } else {
+                            // If no completion was active, treat as regular tab
+                            if single_line {
+                                return false; // Don't consume Tab in single-line mode
+                            }
+                            tb.indent_change(1);
+                        }
+                    } else if single_line {
+                        // If this is just a simple input field and no completion is active, don't consume Tab
                         return false;
+                    } else {
+                        // Regular tab for indentation
+                        tb.indent_change(if modifiers == kbmod::SHIFT { -1 } else { 1 });
                     }
-                    tb.indent_change(if modifiers == kbmod::SHIFT { -1 } else { 1 });
                 }
                 vk::RETURN => {
                     if single_line {
@@ -2711,6 +2725,11 @@ impl<'a> Context<'a, '_> {
                     }
                 }
                 vk::UP => {
+                    if tb.is_completing() {
+                        tb.select_prev_completion();
+                        return true; // Consume the key event to prevent cursor movement
+                    }
+                    // If not completing, let the default UP logic handle it below
                     if single_line {
                         return false;
                     }
@@ -2773,6 +2792,11 @@ impl<'a> Context<'a, '_> {
                     }
                 }
                 vk::DOWN => {
+                    if tb.is_completing() {
+                        tb.select_next_completion();
+                        return true; // Consume the key event to prevent cursor movement
+                    }
+                    // If not completing, let the default DOWN logic handle it below
                     if single_line {
                         return false;
                     }
@@ -2896,143 +2920,6 @@ impl<'a> Context<'a, '_> {
                     } else {
                         // For regular space, just write it
                         write = b" ";
-                    }
-                },
-                vk::TAB => {
-                    // Handle Tab differently - it could be for completion or indentation
-                    if tb.is_completing() {
-                        // If we're in the middle of a completion, accept it
-                        if tb.accept_current_completion() {
-                            // Successfully accepted completion
-                        } else {
-                            // If no completion was active, treat as regular tab
-                            if single_line {
-                                return false; // Don't consume Tab in single-line mode
-                            }
-                            tb.indent_change(1);
-                        }
-                    } else if single_line {
-                        // If this is just a simple input field and no completion is active, don't consume Tab
-                        return false;
-                    } else {
-                        // Regular tab for indentation
-                        tb.indent_change(if modifiers == kbmod::SHIFT { -1 } else { 1 });
-                    }
-                },
-                // Arrow keys for navigating completion items
-                vk::UP => {
-                    if tb.is_completing() {
-                        tb.select_prev_completion();
-                        return false; // Don't consume the key event, so it won't move cursor
-                    }
-                    // If not completing, let the default UP logic handle it below
-                    if single_line {
-                        return false;
-                    }
-                    match modifiers {
-                        kbmod::NONE => {
-                            let mut x = tc.preferred_column;
-                            let mut y = tb.cursor_visual_pos().y - 1;
-
-                            // If there's a selection we put the cursor above it.
-                            if let Some((beg, _)) = tb.selection_range() {
-                                x = beg.visual_pos.x;
-                                y = beg.visual_pos.y - 1;
-                                tc.preferred_column = x;
-                            }
-
-                            // If the cursor was already on the first line,
-                            // move it to the start of the buffer.
-                            if y < 0 {
-                                x = 0;
-                                tc.preferred_column = 0;
-                            }
-
-                            tb.cursor_move_to_visual(Point { x, y });
-                        }
-                        kbmod::CTRL => {
-                            tc.scroll_offset.y -= 1;
-                            make_cursor_visible = false;
-                        }
-                        kbmod::SHIFT => {
-                            // If the cursor was already on the first line,
-                            // move it to the start of the buffer.
-                            if tb.cursor_visual_pos().y == 0 {
-                                tc.preferred_column = 0;
-                            }
-
-                            tb.selection_update_visual(Point {
-                                x: tc.preferred_column,
-                                y: tb.cursor_visual_pos().y - 1,
-                            });
-                        }
-                        kbmod::ALT => tb.move_selected_lines(MoveLineDirection::Up),
-                        kbmod::CTRL_ALT => {
-                            // TODO: Add cursor above
-                        }
-                        _ => return false,
-                    }
-                },
-                vk::DOWN => {
-                    if tb.is_completing() {
-                        tb.select_next_completion();
-                        return false; // Don't consume the key event, so it won't move cursor
-                    }
-                    // If not completing, let the default DOWN logic handle it below
-                    if single_line {
-                        return false;
-                    }
-                    match modifiers {
-                        kbmod::NONE => {
-                            let mut x = tc.preferred_column;
-                            let mut y = tb.cursor_visual_pos().y + 1;
-
-                            // If there's a selection we put the cursor below it.
-                            if let Some((_, end)) = tb.selection_range() {
-                                x = end.visual_pos.x;
-                                y = end.visual_pos.y + 1;
-                                tc.preferred_column = x;
-                            }
-
-                            // If the cursor was already on the last line,
-                            // move it to the end of the buffer.
-                            if y >= tb.visual_line_count() {
-                                x = CoordType::MAX;
-                            }
-
-                            tb.cursor_move_to_visual(Point { x, y });
-
-                            // If we fell into the `if y >= tb.get_visual_line_count()` above, we wanted to
-                            // update the `preferred_column` but didn't know yet what it was. Now we know!
-                            if x == CoordType::MAX {
-                                tc.preferred_column = tb.cursor_visual_pos().x;
-                            }
-                        }
-                        kbmod::CTRL => {
-                            tc.scroll_offset.y += 1;
-                            make_cursor_visible = false;
-                        }
-                        kbmod::SHIFT => {
-                            // If the cursor was already on the last line,
-                            // move it to the end of the buffer.
-                            if tb.cursor_visual_pos().y >= tb.visual_line_count() - 1 {
-                                tc.preferred_column = CoordType::MAX;
-                            }
-
-                            tb.selection_update_visual(Point {
-                                x: tc.preferred_column,
-                                y: tb.cursor_visual_pos().y + 1,
-                            });
-
-                            if tc.preferred_column == CoordType::MAX {
-                                tc.preferred_column = tb.cursor_visual_pos().x;
-                            }
-                        }
-                        kbmod::ALT => tb.move_selected_lines(MoveLineDirection::Down),
-                        kbmod::CTRL_ALT => {
-                            // TODO: Add cursor above
-                        }
-                        _ => return false,
                     }
                 },
                 _ => return false,

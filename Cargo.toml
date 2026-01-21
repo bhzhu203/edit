@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["crates/edit"]
-members = ["crates/*", "test_project"]
+members = ["crates/*", "final_test_dir"]
 resolver = "2"
 
 [workspace.package]
