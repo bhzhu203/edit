@@ -302,6 +302,12 @@ fn print_version() {
 }
 
 fn draw(ctx: &mut Context, state: &mut State) {
+    // Sync the syntax highlighting setting with the active document
+    if let Some(doc) = state.documents.active_mut() {
+        let mut tb = doc.buffer.borrow_mut();
+        tb.set_syntax_highlighting(state.coding_mode_enabled);
+    }
+    
     draw_menubar(ctx, state);
     draw_editor(ctx, state);
     draw_statusbar(ctx, state);

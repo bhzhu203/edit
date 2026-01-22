@@ -247,6 +247,7 @@ pub struct TextBuffer {
     newlines_are_crlf: bool,
     insert_final_newline: bool,
     overtype: bool,
+    syntax_highlighting_enabled: bool,
 
     wants_cursor_visibility: bool,
 
@@ -298,6 +299,7 @@ impl TextBuffer {
             newlines_are_crlf: cfg!(windows), // Windows users want CRLF
             insert_final_newline: false,
             overtype: false,
+            syntax_highlighting_enabled: true, // Enable by default as requested
 
             wants_cursor_visibility: false,
             auto_completer: AutoCompleter::default(),
@@ -584,6 +586,16 @@ impl TextBuffer {
     /// Sets whether the line the cursor is on should be highlighted.
     pub fn set_line_highlight_enabled(&mut self, enabled: bool) {
         self.line_highlight_enabled = enabled;
+    }
+
+    /// Returns whether syntax highlighting is enabled.
+    pub fn is_syntax_highlighting_enabled(&self) -> bool {
+        self.syntax_highlighting_enabled
+    }
+
+    /// Sets whether syntax highlighting should be enabled.
+    pub fn set_syntax_highlighting(&mut self, enabled: bool) {
+        self.syntax_highlighting_enabled = enabled;
     }
 
     /// Sets a ruler column, e.g. 80.
@@ -1874,8 +1886,29 @@ impl TextBuffer {
                     }
                 }
 
+                        // For syntax highlighting, we need to analyze the entire line first
+                // Extract the text for this line to analyze for syntax highlighting
+                let syntax_highlights = if self.syntax_highlighting_enabled {
+                    let mut line_text = String::new();
+                    let mut temp_global_off = cursor_beg.offset;
+                    while temp_global_off < cursor_end.offset {
+                        let chunk = self.read_forward(temp_global_off);
+                        let chunk = &chunk[..chunk.len().min(cursor_end.offset - temp_global_off)];
+                        // Convert bytes to string for syntax analysis
+                        if let Ok(str_chunk) = std::str::from_utf8(chunk) {
+                            line_text.push_str(str_chunk);
+                        }
+                        temp_global_off += chunk.len();
+                    }
+                    self.analyze_syntax(&line_text)
+                } else {
+                    Vec::new()
+                };
+
                 let mut global_off = cursor_beg.offset;
                 let mut cursor_line = cursor_beg;
+                let mut text_analysis_pos = 0; // Track position in the analyzed text
+                let mut visual_pos_tracker = 0; // Track position in the rendered line (after margin)
 
                 while global_off < cursor_end.offset {
                     let chunk = self.read_forward(global_off);
@@ -1886,14 +1919,14 @@ impl TextBuffer {
                     // >25% of the total rendering time is spent here.
                     loop {
                         let chunk_off = it.offset();
-                        let global_off = global_off + chunk_off;
+                        let current_global_off = global_off + chunk_off;
                         let Some(ch) = it.next() else {
                             break;
                         };
 
                         if ch == ' ' || ch == '\t' {
                             let is_tab = ch == '\t';
-                            let visualize = selection_off.contains(&global_off);
+                            let visualize = selection_off.contains(&current_global_off);
                             let mut whitespace = TAB_WHITESPACE;
                             let mut prefix_add = 0;
 
@@ -1902,7 +1935,7 @@ impl TextBuffer {
                                 // or set the foreground color of the visualizer, respectively.
                                 // TODO: Doing this char-by-char is of course also bad for performance.
                                 cursor_line =
-                                    self.cursor_move_to_offset_internal(cursor_line, global_off);
+                                    self.cursor_move_to_offset_internal(cursor_line, current_global_off);
                             }
 
                             let tab_size =
@@ -1933,6 +1966,8 @@ impl TextBuffer {
                             }
 
                             line.push_str(&whitespace[..prefix_add + tab_size as usize]);
+                            text_analysis_pos += 1; // Increment position counter for space/tab
+                            visual_pos_tracker += prefix_add as CoordType + tab_size; // Update visual position tracker
                         } else if ch <= '\x1f' || ('\u{7f}'..='\u{9f}').contains(&ch) {
                             // Append a Unicode representation of the C0 or C1 control character.
                             visualizer_buf[2] = if ch <= '\x1f' {
@@ -1948,7 +1983,7 @@ impl TextBuffer {
 
                             // Highlight the control character yellow.
                             cursor_line =
-                                self.cursor_move_to_offset_internal(cursor_line, global_off);
+                                self.cursor_move_to_offset_internal(cursor_line, current_global_off);
                             let visualizer_rect = {
                                 let left =
                                     destination.left + self.margin_width + cursor_line.visual_pos.x
@@ -1960,8 +1995,34 @@ impl TextBuffer {
                             let fg = fb.contrasted(bg);
                             fb.blend_bg(visualizer_rect, bg);
                             fb.blend_fg(visualizer_rect, fg);
+                            text_analysis_pos += 1; // Increment position counter for control char
+                            visual_pos_tracker += 1; // Update visual position tracker
                         } else {
                             line.push(ch);
+                            
+                            // Apply syntax highlighting if enabled
+                            if self.syntax_highlighting_enabled {
+                                // Look for this character's position in the syntax highlights
+                                for &(pos, color) in &syntax_highlights {
+                                    if pos == text_analysis_pos {
+                                        // Apply syntax highlighting to this character's position
+                                        let highlight_visual_x = origin.x + visual_pos_tracker; // Use the tracked visual position
+                                        let left = destination.left + self.margin_width + highlight_visual_x - origin.x;
+                                        let top = destination.top + y;
+                                        let rect = Rect { 
+                                            left, 
+                                            top, 
+                                            right: left + 1, 
+                                            bottom: top + 1 
+                                        };
+                                        
+                                        fb.blend_fg(rect, fb.indexed(color));
+                                        break; // Found the color for this position
+                                    }
+                                }
+                            }
+                            text_analysis_pos += 1; // Increment position counter for regular char
+                            visual_pos_tracker += 1; // Increment visual position tracker
                         }
                     }
 
@@ -2966,6 +3027,158 @@ impl TextBuffer {
     /// Get completion suggestions for a given prefix (for testing/debugging)
     pub fn get_completions_for_prefix(&self, prefix: &str) -> Vec<crate::buffer::autocomplete::CompletionItem> {
         self.auto_completer.provider.get_completions(self, prefix)
+    }
+
+    /// Perform syntax highlighting analysis on the given text
+    fn analyze_syntax(&self, text: &str) -> Vec<(usize, crate::framebuffer::IndexedColor)> {
+        if !self.syntax_highlighting_enabled {
+            return vec![];
+        }
+
+        let mut highlights = Vec::new();
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        let len = chars.len();
+
+        // Define common keywords for syntax highlighting
+        let keywords = [
+            "abstract", "alignof", "as", "async", "await", "become", "box", "break", 
+            "const", "continue", "crate", "do", "dyn", "else", "enum", "extern", 
+            "false", "final", "fn", "for", "if", "impl", "in", "let", "loop", 
+            "macro", "match", "mod", "move", "mut", "offsetof", "override", "priv", 
+            "proc", "pub", "pure", "ref", "return", "Self", "self", "sizeof", 
+            "static", "struct", "super", "trait", "true", "try", "type", "typeof", 
+            "union", "unsafe", "unsized", "use", "virtual", "where", "while", 
+            "yield", "int", "float", "double", "char", "bool", "void", "long", 
+            "short", "signed", "unsigned", "string", "var", "const", "var", 
+            "function", "class", "extends", "import", "export", "default", "new", 
+            "delete", "this", "null", "undefined", "try", "catch", "finally", 
+            "throw", "switch", "case", "default", "break", "continue", "return"
+        ];
+
+        while i < len {
+            let start = i;
+
+            // Check for string literals (starting with " or ')
+            if chars[i] == '"' || chars[i] == '\'' {
+                let quote_char = chars[i];
+                highlights.push((start, crate::framebuffer::IndexedColor::BrightGreen)); // Start of string
+                i += 1;
+                
+                // Process the string content
+                while i < len {
+                    if chars[i] == '\\' && i + 1 < len {
+                        // Escape sequence - highlight both the \ and the next char
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightGreen));
+                        i += 1;
+                        if i < len {
+                            highlights.push((i, crate::framebuffer::IndexedColor::BrightGreen));
+                            i += 1;
+                        }
+                    } else if chars[i] == quote_char {
+                        // End of string
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightGreen));
+                        i += 1;
+                        break;
+                    } else {
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightGreen));
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            
+            // Check for comments (// or /* */)
+            if i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+                // Single line comment
+                while i < len && chars[i] != '\n' {
+                    highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow));
+                    i += 1;
+                }
+                continue;
+            }
+            
+            if i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+                // Multi-line comment
+                highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow)); // /
+                i += 1;
+                highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow)); // *
+                i += 1;
+                
+                while i + 1 < len {
+                    if chars[i] == '*' && chars[i + 1] == '/' {
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow)); // *
+                        i += 1;
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow)); // /
+                        i += 1;
+                        break;
+                    } else {
+                        highlights.push((i, crate::framebuffer::IndexedColor::BrightYellow));
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            
+            // Check for numbers (starting with digit or dot followed by digit)
+            if (chars[i].is_ascii_digit()) || 
+               (chars[i] == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+                highlights.push((start, crate::framebuffer::IndexedColor::BrightCyan)); // Highlight first digit
+                i += 1;
+                
+                // Continue highlighting digits, dots, exponents, hex indicators
+                while i < len && 
+                      (chars[i].is_ascii_digit() || 
+                       chars[i] == '.' || 
+                       chars[i] == 'x' || 
+                       chars[i] == 'X' || 
+                       chars[i] == '_' ||
+                       chars[i] == 'e' || 
+                       chars[i] == 'E' ||
+                       chars[i] == '+' ||
+                       chars[i] == '-') {
+                    highlights.push((i, crate::framebuffer::IndexedColor::BrightCyan));
+                    i += 1;
+                    
+                    // Break if we hit an exponent sign that's not part of the number
+                    if i > 1 && (chars[i-1] == 'e' || chars[i-1] == 'E') && 
+                       (chars[i] == '+' || chars[i] == '-') && 
+                       i < len && !chars[i].is_ascii_digit() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            
+            // Check for identifiers and keywords
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let mut identifier = String::new();
+                let ident_start = i;
+                
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    identifier.push(chars[i]);
+                    i += 1;
+                }
+                
+                // Check if the identifier is a keyword
+                if keywords.contains(&identifier.as_str()) {
+                    for j in ident_start..i {
+                        highlights.push((j, crate::framebuffer::IndexedColor::BrightMagenta));
+                    }
+                } else {
+                    // Highlight as a regular identifier (could be a variable)
+                    for j in ident_start..i {
+                        highlights.push((j, crate::framebuffer::IndexedColor::BrightBlue));
+                    }
+                }
+                continue;
+            }
+            
+            // Move to next character
+            i += 1;
+        }
+        
+        highlights
     }
 }
 
