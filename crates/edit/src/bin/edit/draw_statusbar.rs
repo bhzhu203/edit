@@ -158,16 +158,14 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
             ),
         );
 
-        // Add coding mode toggle button
         let coding_mode_text = if state.coding_mode_enabled { "CODE" } else { "TEXT" };
         let coding_mode_style = if state.coding_mode_enabled {
             ButtonStyle::default().checked(true)
         } else {
             ButtonStyle::default().checked(false)
         };
-        if ctx.button("coding-mode", coding_mode_text, coding_mode_style) {
+        if ctx.button("coding_mode", coding_mode_text, coding_mode_style) {
             state.coding_mode_enabled = !state.coding_mode_enabled;
-            // Update syntax highlighting setting in the text buffer
             tb.set_syntax_highlighting(state.coding_mode_enabled);
         }
 

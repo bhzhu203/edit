@@ -220,7 +220,7 @@ impl State {
             osc_title_file_status: Default::default(),
             osc_clipboard_sync: false,
             osc_clipboard_always_send: false,
-            coding_mode_enabled: true, // Default to enabled as requested
+            coding_mode_enabled: false, // Default to TXT mode
             exit: false,
         })
     }
